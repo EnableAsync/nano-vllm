@@ -13,6 +13,8 @@ from nanovllm.engine.model_runner import ModelRunner
 
 
 class LLMEngine:
+    """推理引擎主类。组装 ModelRunner（模型执行）+ Scheduler（调度）+ Tokenizer。
+    主循环：add_request → while step() → 收集结果。"""
 
     def __init__(self, model, **kwargs):
         # 从 kwargs 中筛选出属于 Config 的字段，忽略无关参数
