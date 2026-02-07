@@ -26,19 +26,22 @@ class Qwen3Attention(nn.Module):
         rope_scaling: tuple | None = None,
     ) -> None:
         super().__init__()
+        # --- GQA head 数计算 + TP 切分 ---
+        # 总 Q heads 和 KV heads 各自均分到每个 GPU
         tp_size = dist.get_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        self.num_heads = self.total_num_heads // tp_size        # 本 GPU 的 Q head 数
         self.total_num_kv_heads = num_kv_heads
         assert self.total_num_kv_heads % tp_size == 0
-        self.num_kv_heads = self.total_num_kv_heads // tp_size
+        self.num_kv_heads = self.total_num_kv_heads // tp_size  # 本 GPU 的 KV head 数（GQA 时 < num_heads）
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
 
+        # Q/K/V 合并为一次 GEMM（QKVParallelLinear 内部处理 GQA 不等大小切分）
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -64,6 +67,7 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
+        # Qwen3 无 QKV bias 时使用 Q/K Norm（QK-Norm 稳定训练）
         if not self.qkv_bias:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -73,21 +77,28 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # 1. QKV 投影：一次 GEMM 得到 Q/K/V 拼接结果
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # 2. reshape 为 multi-head 格式：[N, num_heads, head_dim]
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
+        # 3. QK-Norm（Qwen3 无 bias 时启用，稳定大模型训练）
         if not self.qkv_bias:
             q = self.q_norm(q)
             k = self.k_norm(k)
+        # 4. RoPE 旋转位置编码
         q, k = self.rotary_emb(positions, q, k)
+        # 5. Attention（内部区分 Prefill/Decode，管理 KV cache）
         o = self.attn(q, k, v)
+        # 6. 输出投影（RowParallel，包含 all-reduce）
         output = self.o_proj(o.flatten(1, -1))
         return output
 
 
 class Qwen3MLP(nn.Module):
+    """SwiGLU MLP：gate 和 up 合并为一次 GEMM → SiLU 门控 → down 投影。"""
 
     def __init__(
         self,
@@ -96,6 +107,7 @@ class Qwen3MLP(nn.Module):
         hidden_act: str,
     ) -> None:
         super().__init__()
+        # gate_proj 和 up_proj 合并为一个 MergedColumnParallelLinear，一次 GEMM 输出 2*intermediate
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -107,7 +119,7 @@ class Qwen3MLP(nn.Module):
             bias=False,
         )
         assert hidden_act == "silu"
-        self.act_fn = SiluAndMul()
+        self.act_fn = SiluAndMul()  # SiLU(gate) * up
 
     def forward(self, x):
         gate_up = self.gate_up_proj(x)
@@ -148,11 +160,15 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Pre-Norm 残差连接：
+        #   首层（residual=None）：保存原始输入作为 residual，对 hidden_states 做 RMSNorm
+        #   后续层：hidden_states + residual → RMSNorm，同时更新 residual（融合 kernel）
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
+        # Attention 后再做一次 Pre-Norm（post_attention_layernorm），进入 MLP
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
@@ -174,15 +190,19 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
-        residual = None
+        hidden_states = self.embed_tokens(input_ids)  # token id → embedding 向量
+        residual = None                               # 首层无残差
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
+        # 最后一层：将残差加回并做最终 RMSNorm
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
 class Qwen3ForCausalLM(nn.Module):
+    # 权重名映射：HuggingFace checkpoint 中 q_proj/k_proj/v_proj 是分开的，
+    # 但本项目将它们合并为 qkv_proj；同理 gate_proj/up_proj → gate_up_proj。
+    # weight_loader 根据此映射，将原始权重正确拆分并写入合并后的参数。
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
