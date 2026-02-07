@@ -6,11 +6,11 @@
 # Git
 - commit message 使用中文，必须极简。为追求简洁，可忽略语法。句末不要有句号。
 - commit message 建议格式：
-  - `fix：...`
-  - `feat：...`
-  - `refactor：...`
-  - `docs：...`
-  - `exp：...`
+  - `fix: ...`
+  - `feat: ...`
+  - `refactor: ...`
+  - `docs: ...`
+  - `exp: ...`
 
 ## Plans
 - 计划末尾须列出待解决问题（若有）。问题须极简，可忽略语法。
